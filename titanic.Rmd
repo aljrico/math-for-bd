@@ -1,0 +1,613 @@
+---
+title: 'Predicting Survival on the Titanic Dataset'
+author: 'Alejandro Jiménez Rico'
+date: '2018-06-10'
+output:
+  html_document:
+    number_sections: true
+    toc: yes
+    toc_float: true
+    fig_width: 7
+    fig_height: 5
+    theme: cosmo
+    highlight: tango
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(fig.width=12, fig.height=8, fig.path='Figs/',
+                      echo=TRUE, warning=FALSE, message=FALSE)
+```
+
+# Load Libraries
+```{r, message = FALSE}
+# Load packages
+library(tidyverse)
+library(data.table)
+library(waffle)
+library(scales)
+library(viridis)
+library(GGally)
+library(caret)
+library(wru)
+library('nnet')
+library('randomForest')
+
+set.seed(666)
+```
+
+# Define Custom Functions
+
+## NA Replace
+
+This function uses simple bootstrap logic to detect and replace missing values within a data frame. This way, we guarantee that the imputted values follow the same distribution as the present values. Despite that, this method should be used with extreme care, because it does not take into account any other consideration such as interaction between variables. 
+
+```{r}
+na_replace <- function(x){
+	if(is.vector(x) & !is.list(x)){
+		new_x <- x
+		w <- which(is.na(x))
+		y <- x[!is.na(x)]
+		for(i in w) new_x[i] <- sample(x = y, size = 1, replace = TRUE); cat(paste0("... ", floor(i/length(w)*100), "% ... \n"))
+		return(new_x)
+	}else if(is.data.frame(x)){
+		df <- as.data.frame(x)
+		ncols <- ncol(df)
+		for(i in 1:ncols){
+			cat(paste0("... ", floor(i/ncols*100), "% ... \n"))
+			x <- df[i]
+			if(sum(is.na(x)) > 0){
+				new_x <- x
+				w <- which(is.na(x))
+				y <- x[!is.na(x)]
+				for(k in w) new_x[k,] <- sample(x = y, size = 1, replace = TRUE)
+				df[i] <- new_x
+			}
+		}
+		return(df)
+	}else if(is.list(x)){
+		stop("A list can not be evaluated. Please introduce a vector instead.")
+	}else{stop("Unrecognized Format.")}
+}
+```
+
+
+## NA Map
+
+This is a very straightforward function that outputs a pretty ggplot spotting the missing values of a data frame.
+
+```{r}
+na_map <- function(x){
+	require(tidyverse)
+	require(viridis)
+
+	x %>%
+		is.na() %>%
+		melt() %>%
+		ggplot(data = .,
+					 aes(x = Var2,
+					 		y = Var1)) +
+		geom_raster(aes(fill = value)) +
+		theme_minimal() +
+		theme(axis.text.x  = element_text(angle=45, vjust=0.5)) +
+		labs(x = "Variables in Dataset",
+				 y = "Rows / observations") +
+		scale_fill_brewer(name = "", labels = c("Present", "Missing"), type = "div", palette = 4, direction = -1)
+
+}
+```
+
+
+
+
+# Retrieve Data
+
+For this project, we are going to try to predict the survival in the RMS Titanic disaster, using the data prorvided by the Data Science competition site Kaggle.
+
+- [Kaggle Official Website.](http://kaggle.com/)
+- [Titanic Data.](https://www.kaggle.com/c/titanic/data)
+
+Since the dataset consists on two datasets, one for training the model and the other one to submit the competition, we are going to use both of them.
+
+We start loading the data and giving it a brief look.
+
+```{r, message=FALSE, warning=FALSE}
+train <- fread('train.csv', stringsAsFactors = FALSE)
+test <- fread('test.csv', stringsAsFactors = FALSE)
+
+full <- bind_rows(train, test)
+str(full)
+```
+
+Now we know the dimensions of our dataset, and have a sense of its variables. We know their class type, and the kind of observations they contain. We also can see that we have plenty of *empty* values. We'll substitute those by *NA*.
+
+```{r}
+full[full == ""] <- NA
+```
+
+# Missing Values
+
+Dealing with missing values is one of the messiest tasks to address in Data Science. There is a myriad of ways we could face them, and none of them is perfect. The simplest approach would be simply removing all rows containing missing values, but given the small size of the data set, we probably shouldn't do it.
+
+Note that the missing values for the **Survived** variable are because those are from the test set.
+
+
+```{r}
+na_map(full)
+```
+
+
+## Single value imputation
+
+When we have a few missin values in a given column, we might be able to study thoroughly the situation of those missing values, and to fill them manually. The advantage of this technique is that we can reckon the origin of a missing value or, at least, make an educated guess of what should they be. 
+
+On the other hand, single value imputation is utterly non-escalable and most of the times just unrealistic to perform. Simply because is not possible to iterate this process over hundreds of missing values with even more combinations with different variables. 
+
+Fortunately, we have found a few cases in this playground-level dataset where we can show it off.
+
+### Embarkment
+
+If we take a close look to the variable **Embarked**, we can notice two missing values. We don't know where passenger 62 and 830 embarked.
+
+```{r}
+sum(is.na(full$Embarked))
+
+full[c(62, 830),]
+```
+We will infer their values based on present data.
+
+For example, let's take a look at how much money people paid, based on their embarkment. We can check that both passengers 62 and 830 paid exactly 80$ for their embarkment fare and that they were in *First Class*. It is reasonable to assume that the embarkment fare is related to the embarkment itself. So we'll look where do people embarked and how much they paid.
+
+
+```{r, message=FALSE, warning=FALSE}
+
+# Get rid of our missing passenger IDs
+embark_fare <- full %>%
+  filter(PassengerId != 62 & PassengerId != 830)
+
+# Use ggplot2 to visualize embarkment, passenger class, & median fare
+ggplot(embark_fare, aes(x = Embarked, y = Fare, fill = factor(Pclass))) +
+  geom_boxplot() +
+  geom_hline(aes(yintercept=80), 
+    colour='red', linetype='dashed', lwd=1) +
+  scale_y_continuous(labels=dollar_format()) +
+  theme_minimal() +
+	scale_fill_brewer()
+```
+
+The median fare for a first class passenger departing from Charbourg ('C') coincides nicely with the $80 paid by our embarkment-deficient passengers. Therefore, we can safely replace the NA values with 'C'.
+
+```{r}
+full$Embarked[c(62, 830)] <- 'C'
+```
+
+
+### Fare
+
+We also have another isolated missing value in the **Fare** category.
+```{r, message=FALSE, warning=FALSE}
+full[1044, ]
+```
+
+This is a third class passenger who departed from Southampton ('S'). As before, now let's visualize *Fares* among all others sharing their class and embarkment.
+
+```{r, message=FALSE, warning=FALSE}
+
+median_fare <- median(full %>% filter(Pclass == 3) %>% filter(Embarked == 'S') %>% select(Fare) %>% na.omit() %>% c() %>% unlist())
+
+full %>% 
+	filter(Pclass == 3) %>% 
+	filter(Embarked == 'S') %>% 
+	ggplot() +
+	  geom_histogram(alpha=0.4, colour = "black", binwidth = 2, aes(x = Fare, y = ..count../sum(..count..)*100, fill = log(..count../sum(..count..)))) + 
+	  scale_x_continuous(labels=dollar_format()) +
+		geom_vline(xintercept = median_fare,
+							 colour = "red", 
+							 size = 0.8) +
+		annotate("text", x = median_fare + 7, y = 55, label = "Median", colour = "red") +
+		scale_fill_viridis(begin = 0.1, end = 0.6, option = "D", direction = 1) +
+	  theme_minimal() +
+		theme(legend.position  = "NONE") +
+		xlab("Fare") +
+		ylab("(%)")
+```
+
+From this visualization, it seems quite reasonable to replace the NA Fare value with median for their class and embarkment.
+
+```{r}
+full$Fare[1044] <- median_fare
+```
+
+## Predictive imputation
+
+There is a myriad of different techniques to automatically imput missing values. Computing the mean, the median, the maximum, and so on. 
+
+
+The state-of-the-art on prpedictive imputation is the `mice` package. This package's method is based on *Fully Conditional Specification*. There is an incredibly insightful paper on *Multiple Imputation Chained Equations* that you can read [here](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3074241/). 
+
+Nevertheless, for the sake of originality I decided to define a custom function called `na_replace` that tries to impute the missing values using bootstrap samples.
+
+Firstly, let us compare the results we get with the original distribution of passenger ages to ensure that nothing has gone completely awry.
+
+```{r, message=FALSE, warning=FALSE}
+
+factor_vars <- c('PassengerId','Pclass','Sex','Embarked', 'Name', "Ticket", "Cabin", "Embarked")
+
+imputed <- na_replace(full)
+
+par(mfrow=c(1,2))
+
+gg_original <- full %>% 
+	ggplot(aes(x = Age, fill = ..count../sum(..count..)*100)) +
+	geom_histogram(colour = "black") +
+	theme_minimal() +
+	scale_fill_distiller(palette = 1) +
+	xlab("Age") +
+	ylab("(%)") +
+	ggtitle("Original Data") +
+	annotate("text", x = 60, y = 55, label = "Original Data", colour = "black") +
+	theme(legend.position = "none")
+
+gg_imputed <- imputed %>% 
+	ggplot(aes(x = Age, fill = ..count../sum(..count..)*100)) +
+	geom_histogram(colour = "black") +
+	theme_minimal() +
+	scale_fill_distiller(palette = 2) +
+	xlab("Age") +
+	ylab("(%)") +
+	ggtitle("Imputed Data") +
+	annotate("text", x = 60, y = 70, label = "Imputed Data", colour = "black") +
+	theme(legend.position = "none")
+
+ggmatrix(plots = list(gg_original, gg_imputed), nrow = 1, ncol = 2)
+
+```
+
+Things look good, so we are gonna keep the imputed data.
+
+```{r}
+full <- imputed
+```
+
+
+# Feature Engineering
+
+
+## Deck
+
+```{r}
+head(full$Cabin)
+```
+
+Interesting thing about the variable **Cabin** is that it is made of numbers and letters, where the letter is telling us the Deck. We are going to take a look at that and create a new variable out of it.
+
+```{r}
+# Create a Deck variable. Get passenger deck A - F:
+full$Deck<-factor(sapply(full$Cabin, function(x) strsplit(x, NULL)[[1]][1]))
+```
+
+
+## Mother & Children
+
+Now we can create a couple of new age-dependent variables: **Child** and **Mother**. A child will simply be someone under 18 years of age and a mother is a passenger who is *female*, over 18 and has more than 0 children.
+
+```{r, message=FALSE, warning=FALSE}
+full$Child[full$Age < 18] <- 'Child'
+full$Child[full$Age >= 18] <- 'Adult'
+
+full[1:891,] %>% 
+	na.omit() %>% 
+	ggplot(aes(Age, fill = factor(Survived))) + 
+  geom_histogram(colour = "black") + 
+  facet_grid(.~Child) + 
+  theme_minimal() +
+	scale_fill_viridis(discrete = TRUE, name = "Survived") 
+
+```
+
+We couldn't say whether or not being a child is useful in order to survive, but we'll keep the new feature anyway. We will finish off our feature engineering by creating the **Mother** variable. Maybe we can hope that mothers are more likely to have survived on the Titanic.
+
+
+```{r}
+# Adding Mother variable
+full$Mother <- 'nomother'
+full$Mother[full$Sex == 'female' & full$Parch > 0 & full$Age > 18] <- 'Mother'
+
+# Finish by factorizing our two new factor variables
+full$Child  <- factor(full$Child)
+full$Mother <- factor(full$Mother)
+
+full[1:891,] %>% 
+	na.omit() %>% 
+	ggplot(aes(Age, fill = factor(Survived))) + 
+  geom_histogram(colour = "black", binwidth = 3) + 
+  facet_grid(.~Mother) + 
+  theme_minimal() +
+	scale_fill_viridis(discrete = TRUE, name = "Survived") 
+```
+
+## Title
+
+Where the Titanic sinked, society was much more classist than now, and so we can fairly assume that those people with a proper *Title* in ther name would have had more chances to get help from the security forces of the ship, or maybe access to more robut survival resources. Anyway, we are going to craft a variable trying to stuff this information into a predictive feature.
+
+```{r}
+# Grab title from passenger names
+full$Title <- gsub('(.*, )|(\\..*)', '', full$Name)
+
+full %>% 
+	ggplot(aes(fill = as.factor(Title), x=reorder(Title, -table(Title)[Title]))) +
+	geom_bar(aes(y = ..count../sum(..count..)*100), colour = "black") +
+	theme_minimal() +
+	xlab("Title") +
+	ylab("(%)") +
+	scale_fill_viridis(discrete = TRUE, name = "Survived") +
+	theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Titles with very low cell counts to be combined to "rare" level
+rare_title <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 
+                'Major', 'Sir', 'Jonkheer')
+
+# Also reassign mlle, ms, and mme accordingly
+full$Title[full$Title == 'Mlle']        <- 'Miss' 
+full$Title[full$Title == 'Ms']          <- 'Miss'
+full$Title[full$Title == 'Mme']         <- 'Mrs' 
+full$Title[full$Title == 'Rev']         <- 'Rev' 
+full$Title[full$Title == 'Dr']        	<- 'Dr' 
+full$Title[full$Title == 'Master']      <- 'Master' 
+full$Title[full$Title %in% rare_title]  <- 'Rare_Title'
+
+full %>% 
+	ggplot(aes(fill = as.factor(Survived), x=reorder(Title, -table(Title)[Title]))) +
+	geom_bar(aes(y = ..count../sum(..count..)*100), colour = "black") +
+	facet_grid(.~Survived) +
+	theme_minimal() +
+	xlab("Title") +
+	ylab("(%)") +
+	scale_fill_viridis(discrete = TRUE, name = "Survived") +
+	theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+## Ethnicity
+
+Another sad circumstance of that epoch is that bigotry was much more usual than today. Casting aside morality for a moment, we might guess that - because of that bigotry - the **ethnicity** of a person could determine the chances of survival within the Titanic. So we are going to craft another feature based on that. 
+
+In order to do so, we'll extract the surname from the **Name** variable, and we will infer from that their most likely ethnicity. Making use of the dictionary provided by the `wru` package.
+
+```{r}
+full$surname <- sapply(full$Name,  
+                      function(x) strsplit(x, split = '[,.]')[[1]][1])
+
+full <- full %>% as_tibble()
+ethnicitys <- predict_race(full["surname"], surname.only = TRUE) %>% as_tibble()
+
+full <- ethnicitys %>% 
+	dplyr::mutate(ethnicity = colnames(ethnicitys %>% dplyr::select(-surname))[apply(ethnicitys %>% dplyr::select(-surname),1,which.max)]) %>% 
+	dplyr::mutate(ethnicity = ifelse(ethnicity == "pred.whi", "White", ethnicity)) %>% 
+	dplyr::mutate(ethnicity = ifelse(ethnicity == "pred.bla", "Black", ethnicity)) %>% 
+	dplyr::mutate(ethnicity = ifelse(ethnicity == "pred.asi", "Asian", ethnicity)) %>% 
+	dplyr::mutate(ethnicity = ifelse(ethnicity == "pred.his", "Hispanic", ethnicity)) %>% 
+	dplyr::mutate(ethnicity = ifelse(ethnicity == "pred.oth", "Other", ethnicity)) %>% 
+	select(ethnicity) %>% 
+	cbind(full) %>% 
+	select(-surname) %>% 
+	as_tibble()
+
+full %>% 
+	ggplot(aes(x = as.factor(ethnicity), fill = as.factor(Survived))) +
+	geom_bar(aes(y = ..count../sum(..count..)*100)) +
+	facet_grid(.~ Survived) +
+	theme_minimal() +
+	scale_fill_viridis(discrete = TRUE, name = "Survived") +
+	xlab("Ethnicity") +
+	ylab("(%)")
+
+full %>% 
+	ggplot(aes(x = as.factor(ethnicity), fill = as.factor(Survived))) +
+	geom_bar(position = "fill") +
+	theme_minimal() +
+	scale_fill_viridis(discrete = TRUE, name = "Survived") +
+	xlab("Ethnicity") +
+	ylab("Proportion")
+
+```
+
+
+
+
+# Random Forest
+
+At last we're ready to predict who survives among passengers of the Titanic based on variables that we carefully crafted and managed. In order to do this, we will rely on the `randomForest` classification algorithm.
+
+
+We firstly set the variables as factors
+
+```{r}
+
+data <- full
+features <- colnames(data)
+
+for(f in features) {
+	if ((class(data[[f]])=="factor") || (class(data[[f]])=="character")) {
+		levels <- unique(data[[f]])
+		data[[f]] <- (factor(data[[f]], levels=levels))
+	}
+}
+full <- data
+```
+
+
+## Split into training & test sets
+
+Our first step is to split the data back into the original test and training sets.
+
+```{r}
+train <- full[201:891,]
+true_test <- full[1:200,]
+test <- full[892:1309,]
+```
+
+## Building the model
+
+We then build our model using `randomForest` on the training set.
+
+Select the variables to be used
+
+```{r}
+train <- train %>% 
+	select(- Name, -PassengerId, -Ticket, -Cabin)
+
+```
+
+
+
+```{r}
+rf_model <- randomForest(factor(Survived) ~ .,
+                                            data = train)
+
+# Show model error
+plot(rf_model, ylim=c(0,0.36))
+legend('topright', colnames(rf_model$err.rate), col=1:3, fill=1:3)
+```
+
+The black line shows the overall error rate which falls below 20%. The red and green lines show the error rate for 'died' and 'survived' respectively. We can see that right now we're much more successful predicting death than we are survival.
+
+
+## Variable importance
+
+Let's look at relative variable importance by plotting the mean decrease in Gini calculated across all trees.
+
+```{r, message=FALSE, warning=FALSE}
+# Get importance
+importance    <- importance(rf_model)
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[ ,'MeanDecreaseGini'],2))
+
+# Create a rank variable based on importance
+rankImportance <- varImportance %>%
+  mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+
+# Use ggplot2 to visualize the relative importance of variables
+ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+    y = Importance, fill = Importance)) +
+  geom_bar(stat='identity') + 
+  labs(x = 'Variables') +
+  coord_flip() + 
+	scale_fill_viridis() +
+  theme_minimal()
+```
+
+Sadly, almost all features we have created are far below this list. Maybe we have been too harsh with the early XX century society.
+
+## Cross Validation
+
+We're ready for the final step, let's use our model to predict data and see how well it perform. One of the advantages of using **Random Forest** is that we shouldn't be so worried about overfitting. Nonetheless, we are going to check it anyway using that silly chunk of data called *true_test* (to be differenciated with the test set of the Kaggle competition, that has no Supervised results).
+
+```{r}
+# Predict using the test set
+prediction <- predict(rf_model, true_test)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+prediction_rf <- data.frame(PassengerID = true_test$PassengerId, survived = prediction)
+reality <- data.frame(PassengerID = true_test$PassengerId, survived = as.factor(true_test$Survived))
+
+confusionMatrix(data = prediction_rf$survived, reference = reality$survived)
+```
+
+
+Woah! So high accuracy on the test set. That is awesome. From the *Confusion Matrix* we can also break down the kind of error our model is incurring to. We could say that we have little bias towards one error or the other. 
+
+This might be a good thing, or not. Depending on the purpose of this predictive model. For example, this kind of model is used in Banking industry in order to reckon default risk. The thing is that in that bussiness, one kind of error is much more expensive than the other, and maybe we would prefer to incurr more in one error than the other.
+
+
+For the sake of completeness, we are going to repeat the construction of a predictive model, but using different methods. So far we have used *Random Forest*. We could try using now a simple *Neural Network* and even combining both results, and see what happens.
+
+# Neural Network
+
+```{r}
+
+data <- full
+
+data <- data %>% 
+	select(- Name, -PassengerId, -Ticket, -Cabin, -Survived)
+
+features <- colnames(data)
+
+chrs <- c()
+for(f in features) {
+	if ((class(data[[f]])=="factor") || (class(data[[f]])=="character")) {
+		chrs <- c(chrs,f)
+		levels <- unique(data[[f]])
+		data[[f]] <- (factor(data[[f]], levels=levels))
+		
+		for(level in unique(data[[paste0(f)]])){
+  		data[paste("dummy", level, sep = "_")] <- ifelse(data[[f]] == level, 1, 0)
+		}
+		
+	}
+}
+
+full_neural <- cbind(PassengerId = full$PassengerId, Survived = full$Survived, data) %>% data.table() %>% select(-chrs)
+
+train_neural <- full_neural[201:891,]
+true_test_neural <- full_neural[1:200,]
+test_neural <- full_neural[892:1309,]
+
+names <- colnames(train_neural %>% select(-Survived, PassengerId))
+formula <- as.formula(paste('Survived ~ ' ,paste(names,collapse='+')))
+
+
+neural_fit <- nnet(formula = formula, data = train_neural, size = round(length(names)/2))
+
+# Predict using the test set
+prediction <- predict(neural_fit, true_test_neural %>% select(names)) %>% round() %>% as.factor()
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+prediction_neural <- data.frame(PassengerID = true_test_neural$PassengerId, survived = prediction)
+reality <- data.frame(PassengerID = true_test_neural$PassengerId, survived = as.factor(true_test_neural$Survived))
+
+confusionMatrix(data = prediction_neural$survived, reference = reality$survived)
+
+```
+
+
+# Ensemble
+
+```{r}
+
+numeric_rf <- predict(rf_model, true_test, type = "prob")[,"1"]
+numeric_neural <- predict(neural_fit, true_test_neural)
+
+survived_ensemble <- as.factor(round((numeric_rf+numeric_neural)/2))
+
+# survived_ensemble <- as.factor(round(((as.numeric(prediction_rf$survived)-1) + (as.numeric(prediction_neural$survived) - 1))/2))
+
+prediction_ensemble <- data.frame(PassengerID = true_test_neural$PassengerId, survived = survived_ensemble)
+confusionMatrix(data = prediction_ensemble$survived, reference = reality$survived)
+
+```
+
+
+
+# Conclusion
+
+We have tried using a Random Forest, a Neural Network, and a combination of both in order to predict the Survivors of the Titanic. The results have shown us that the best model is the **Random Forest**.
+
+Now that we have a preference, we can just train the model with the whole data and predict the real test and submit the prediction.
+
+```{r}
+
+train <- full[1:891,]
+test <- full[892:1309,]
+
+train <- train %>% 
+	select(- Name, -PassengerId, -Ticket, -Cabin)
+
+rf_model <- randomForest(factor(Survived) ~ ., data = train)
+prediction <- predict(rf_model, test)
+prediction_rf <- data.frame(PassengerID = test$PassengerId, Survived = prediction)
+
+write.csv(prediction_rf, file = "titanic_ml_prediction.csv", row.names = FALSE, col.names = TRUE)
+```
+
+---
